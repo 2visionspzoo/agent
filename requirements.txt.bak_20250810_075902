@@ -4,9 +4,3 @@ pandas==2.2.2
 numpy==1.26.4
 ta==0.11.0
 PyYAML==6.0.1
-
-ibapi==9.81.1.post1
-ruamel.yaml==0.18.14
-
-ib_insync==0.9.86
-

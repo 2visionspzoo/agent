@@ -1,4 +1,88 @@
-﻿import threading, datetime as dt
+# --- apply_force_disable_old_sync.ps1 ---
+$ErrorActionPreference = "Stop"
+$P = "C:\agent"
+if (!(Test-Path $P)) { throw "Nie znaleziono katalogu $P" }
+Set-Location $P
+
+# 0) Backup
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+foreach ($f in @(".env","app\main.py","app\prestart.py","agent\conid_sync.py","requirements.txt","sitecustomize.py","Dockerfile","docker-compose.yml")) {
+  $full = Join-Path $P $f; if (Test-Path $full) { Copy-Item $full "$full.bak_$stamp" -Force }
+}
+
+# 1) .env – twarde rozdzielenie ID + blokada starego hooka
+$envPath = Join-Path $P ".env"
+if (!(Test-Path $envPath)) { New-Item -Type File $envPath | Out-Null }
+$envText = Get-Content $envPath -Raw -Encoding UTF8
+function Set-Env([string]$k,[string]$v){
+  if ($script:envText -match ("(?m)^"+[regex]::Escape($k)+"=")) {
+    $script:envText = $script:envText -replace ("(?m)^"+[regex]::Escape($k)+"=.*$"), ($k+"="+$v)
+  } else {
+    if ($script:envText.Length -gt 0 -and -not $script:envText.EndsWith("`n")){ $script:envText += "`n" }
+    $script:envText += ($k+"="+$v+"`n")
+  }
+}
+Set-Env "IBKR_HOST" "host.docker.internal"
+Set-Env "IBKR_PORT" "4003"
+Set-Env "IBKR_CLIENT_ID" "801"
+Set-Env "IBKR_CLIENT_ID_SYNC" "802"
+Set-Env "DISABLE_CONID_SYNC" "1"        # stary hook w main.py (jeśli istnieje) ma być ignorowany
+Set-Env "FORCE_DISABLE_CONID_SYNC" "1"  # sitecustomize nadpisze ensure_conids na no-op
+Set-Env "PRESTART_SYNC_DONE" "0"
+Set-Content -Path $envPath -Encoding UTF8 -Value ($envText.Trim()+"`n")
+
+# 2) sitecustomize.py – globalny no-op dla starego ensure_conids (ładowany automatycznie przez Pythona)
+$sitePath = Join-Path $P "sitecustomize.py"
+@'
+import os
+if os.getenv("FORCE_DISABLE_CONID_SYNC","0") == "1":
+    try:
+        import agent.conid_sync as _cs
+        def _noop(*a, **k):
+            raise RuntimeError("conId sync disabled by sitecustomize")
+        _cs.ensure_conids = _noop
+    except Exception:
+        pass
+'@ | Set-Content -Encoding UTF8 $sitePath
+
+# 3) app\prestart.py – właściwy sync (oddzielny clientId) + krótka pauza
+$prePath = Join-Path $P "app\prestart.py"
+@'
+import os, time, logging
+from agent.conid_sync import ensure_conids
+log = logging.getLogger("app")
+if os.getenv("PRESTART_SYNC_DONE", "0") != "1":
+    try:
+        ensure_conids(
+            path="config/symbols.yaml",
+            host=os.getenv("IBKR_HOST", "host.docker.internal"),
+            port=int(os.getenv("IBKR_PORT", "4003")),
+            client_id=int(os.getenv("IBKR_CLIENT_ID_SYNC", "802")),
+            save_in_place=True
+        )
+        log.info("prestart conId sync: OK")
+    except Exception as e:
+        log.warning(f"prestart conId sync skipped: {e}")
+    finally:
+        os.environ["PRESTART_SYNC_DONE"] = "1"
+        time.sleep(1.5)  # daj IB chwilę by zamknął sesję synca
+'@ | Set-Content -Encoding UTF8 $prePath
+
+# 4) Inject 'import app.prestart' na samą górę app\main.py (nie ruszamy reszty kodu)
+$mainPath = Join-Path $P "app\main.py"
+if (!(Test-Path $mainPath)) { throw "Nie znaleziono $mainPath" }
+$main = Get-Content $mainPath -Raw -Encoding UTF8
+if ($main -notmatch '(?m)^\s*import\s+app\.prestart\b') {
+  $main = "import app.prestart`r`n" + $main
+}
+# usuń ewentualny bezpośredni import ensure_conids (niepotrzebny po sitecustomize)
+$main = [regex]::Replace($main, '(?m)^\s*from\s+agent\.conid_sync\s+import\s+ensure_conids\s*\r?\n', '')
+Set-Content -Path $mainPath -Encoding UTF8 -Value $main
+
+# 5) agent\conid_sync.py – wersja bezpieczna (jeśli już masz – nadpisz)
+$syncPath = Join-Path $P "agent\conid_sync.py"
+@'
+import threading, datetime as dt
 from typing import Dict, Any, List, Optional
 from ruamel.yaml import YAML
 from ibapi.wrapper import EWrapper
@@ -126,7 +210,7 @@ def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, clien
     app = _Resolver()
     app.connect(host, port, client_id)
     t = threading.Thread(target=app.run, daemon=True); t.start()
-    if not app._next_ready.wait(30): raise RuntimeError("Nie poĹ‚Ä…czono z IB Gateway/TWS (brak nextValidId).")
+    if not app._next_ready.wait(30): raise RuntimeError("Nie połączono z IB Gateway/TWS (brak nextValidId).")
 
     changed = False
     for key, val in data.items():
@@ -157,7 +241,7 @@ def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, clien
 
     if changed and save_in_place:
         with open(fp, "w", encoding="utf-8") as f: yaml.dump(data, f)
-        print(f"âś“ Zaktualizowano {fp}")
+        print(f"✓ Zaktualizowano {fp}")
     elif not changed:
         print("Brak zmian w symbolach (conId aktualne).")
     return changed
@@ -171,3 +255,17 @@ if __name__ == "__main__":
     ap.add_argument("--client", type:int, default=802)
     args = ap.parse_args()
     ensure_conids(args.path, args.host, args.port, args.client, save_in_place=True)
+'@ | Set-Content -Encoding UTF8 $syncPath
+
+# 6) requirements.txt – dopisz paczki
+$reqPath = Join-Path $P "requirements.txt"
+if (Test-Path $reqPath) { $req = Get-Content $reqPath -Raw -Encoding UTF8 } else { $req = "" }
+if ($req -notmatch '(?m)^\s*ibapi\b')        { $req += "`nibapi==9.81.1.post1" }
+if ($req -notmatch '(?m)^\s*ruamel\.yaml\b') { $req += "`nruamel.yaml==0.18.14" }
+if ($req -notmatch '(?m)^\s*ib_insync\b')    { $req += "`nib_insync==0.9.86" }
+Set-Content -Path $reqPath -Encoding UTF8 -Value ($req.Trim()+"`n")
+
+# 7) Build & run
+docker compose build app
+docker compose up -d
+docker compose logs -f app

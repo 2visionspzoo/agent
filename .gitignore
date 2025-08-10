@@ -11,3 +11,23 @@ build/
 *.log
 .DS_Store
 Thumbs.db
+
+*.bak
+
+# Python / build
+*.pyo
+*.pyd
+*.so
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+# Environment & logs
+.env.*
+# Editors/OS
+*.swp
+# Project-specific
+config/*secret*.*ml
+config/*secrets*.*ml
+config/*.local.*ml
+data/
+

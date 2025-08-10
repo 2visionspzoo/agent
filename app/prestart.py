@@ -1,0 +1,18 @@
+﻿import os, time, logging
+from agent.conid_sync import ensure_conids
+log = logging.getLogger("app")
+if os.getenv("PRESTART_SYNC_DONE", "0") != "1":
+    try:
+        ensure_conids(
+            path="config/symbols.yaml",
+            host=os.getenv("IBKR_HOST", "host.docker.internal"),
+            port=int(os.getenv("IBKR_PORT", "4003")),
+            client_id=int(os.getenv("IBKR_CLIENT_ID_SYNC", "802")),
+            save_in_place=True
+        )
+        log.info("prestart conId sync: OK")
+    except Exception as e:
+        log.warning(f"prestart conId sync skipped: {e}")
+    finally:
+        os.environ["PRESTART_SYNC_DONE"] = "1"
+        time.sleep(1.5)  # daj IB chwilÄ™ by zamknÄ…Ĺ‚ sesjÄ™ synca

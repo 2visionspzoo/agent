@@ -1,4 +1,39 @@
-﻿import threading, datetime as dt
+# --- apply_split_ids_and_prestart.ps1 ---
+$ErrorActionPreference = "Stop"
+$P = "C:\agent"
+if (!(Test-Path $P)) { throw "Nie znaleziono katalogu $P" }
+Set-Location $P
+
+# 0) Backup
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+foreach ($f in @(".env","app\main.py","app\prestart.py","agent\conid_sync.py","requirements.txt","Dockerfile","docker-compose.yml")) {
+  $full = Join-Path $P $f; if (Test-Path $full) { Copy-Item $full "$full.bak_$stamp" -Force }
+}
+
+# 1) .env – różne ID + host/port + wyłącz poprzedni sync w main.py
+$envPath = Join-Path $P ".env"
+if (!(Test-Path $envPath)) { New-Item -Type File $envPath | Out-Null }
+$envText = Get-Content $envPath -Raw -Encoding UTF8
+function Set-EnvLine([string]$k,[string]$v){
+  if ($script:envText -match ("(?m)^"+[regex]::Escape($k)+"=")) {
+    $script:envText = $script:envText -replace ("(?m)^"+[regex]::Escape($k)+"=.*$"), ($k+"="+$v)
+  } else {
+    if ($script:envText.Length -gt 0 -and -not $script:envText.EndsWith("`n")){ $script:envText += "`n" }
+    $script:envText += ($k+"="+$v+"`n")
+  }
+}
+Set-EnvLine "IBKR_HOST" "host.docker.internal"
+Set-EnvLine "IBKR_PORT" "4003"
+Set-EnvLine "IBKR_CLIENT_ID" "501"
+Set-EnvLine "IBKR_CLIENT_ID_SYNC" "502"
+Set-EnvLine "DISABLE_CONID_SYNC" "1"   # wyłączamy stare hooki w main.py
+Set-EnvLine "PRESTART_SYNC_DONE" "0"
+Set-Content -Path $envPath -Encoding UTF8 -Value ($envText.Trim()+"`n")
+
+# 2) agent\conid_sync.py – wersja bezpieczna (walidacja + FX/CMDTY/CFD)
+$syncPath = Join-Path $P "agent\conid_sync.py"
+@'
+import threading, datetime as dt
 from typing import Dict, Any, List, Optional
 from ruamel.yaml import YAML
 from ibapi.wrapper import EWrapper
@@ -19,19 +54,25 @@ def normalize_entry(key: str, d: Dict[str, Any]) -> Dict[str, Any]:
     out["secType"] = (out.get("secType") or "").upper()
     if out.get("symbol") is not None: out["symbol"] = str(out.get("symbol") or "").upper()
     if not out.get("exchange"): out["exchange"] = "SMART"
+
+    # FX (CASH): USDJPY lub symbol+currency
     if out["secType"] == "CASH":
-        sym = out.get("symbol") or ""; cur = (out.get("currency") or "").upper()
+        sym = out.get("symbol") or ""
+        cur = (out.get("currency") or "").upper()
         if len(sym) >= 6 and sym[:3].isalpha() and sym[-3:].isalpha():
             out["symbol"], out["currency"] = sym[:3], sym[-3:]
         elif len(sym) == 3 and cur:
             out["symbol"], out["currency"] = sym[:3], cur
         if not out.get("exchange"): out["exchange"] = "IDEALPRO"
+
+    # CMDTY metale: XAUUSD -> XAU/USD
     if out["secType"] == "CMDTY":
         sym = out.get("symbol") or ""
         if len(sym) >= 6 and sym[:3].isalpha() and sym[-3:].isalpha():
             base, quote = sym[:3], sym[-3:]
             if base in {"XAU","XAG","XPT","XPD"}:
                 out["symbol"], out["currency"] = base, quote
+
     return out
 
 def to_contract(key: str, d: Dict[str, Any]) -> Contract:
@@ -119,20 +160,21 @@ class _Resolver(EWrapper, EClient):
         if not evt.wait(timeout): return None
         return pick_best(normalize_entry(key, item), self._res.get(reqId, []))
 
-def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, client_id=802, save_in_place=True) -> bool:
+def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, client_id=502, save_in_place=True) -> bool:
     fp = Path(path)
     data = yaml.load(fp.read_text(encoding="utf-8"))
 
     app = _Resolver()
     app.connect(host, port, client_id)
     t = threading.Thread(target=app.run, daemon=True); t.start()
-    if not app._next_ready.wait(30): raise RuntimeError("Nie poĹ‚Ä…czono z IB Gateway/TWS (brak nextValidId).")
+    if not app._next_ready.wait(30): raise RuntimeError("Nie połączono z IB Gateway/TWS (brak nextValidId).")
 
     changed = False
     for key, val in data.items():
         if not isinstance(val, dict): continue
         try: _ = to_contract(key, val)
-        except Exception as ve: print(f"[{key}] Pomijam: {ve}"); continue
+        except Exception as ve:
+            print(f"[{key}] Pomijam: {ve}"); continue
 
         need_lookup = not val.get("conId")
         if val.get("conId"):
@@ -157,7 +199,7 @@ def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, clien
 
     if changed and save_in_place:
         with open(fp, "w", encoding="utf-8") as f: yaml.dump(data, f)
-        print(f"âś“ Zaktualizowano {fp}")
+        print(f"✓ Zaktualizowano {fp}")
     elif not changed:
         print("Brak zmian w symbolach (conId aktualne).")
     return changed
@@ -168,6 +210,60 @@ if __name__ == "__main__":
     ap.add_argument("--in", dest="path", default="config/symbols.yaml")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4003)
-    ap.add_argument("--client", type:int, default=802)
+    ap.add_argument("--client", type=int, default=502)
     args = ap.parse_args()
     ensure_conids(args.path, args.host, args.port, args.client, save_in_place=True)
+'@ | Set-Content -Encoding UTF8 $syncPath
+
+# 3) app\prestart.py – sync przed startem (osobny clientId + krótki sleep)
+$prePath = Join-Path $P "app\prestart.py"
+@'
+import os, time, logging
+from agent.conid_sync import ensure_conids
+log = logging.getLogger("app")
+if os.getenv("PRESTART_SYNC_DONE", "0") != "1":
+    try:
+        ensure_conids(
+            path="config/symbols.yaml",
+            host=os.getenv("IBKR_HOST", "host.docker.internal"),
+            port=int(os.getenv("IBKR_PORT", "4003")),
+            client_id=int(os.getenv("IBKR_CLIENT_ID_SYNC", "502")),
+            save_in_place=True
+        )
+        log.info("prestart conId sync: OK")
+    except Exception as e:
+        log.warning(f"prestart conId sync skipped: {e}")
+    finally:
+        os.environ["PRESTART_SYNC_DONE"] = "1"
+        time.sleep(1.5)  # odczekaj, by IB domknął sesję; unikasz #326
+'@ | Set-Content -Encoding UTF8 $prePath
+
+# 4) app\main.py – usuń stare hooki ensure_conids i dodaj import prestart
+$mainPath = Join-Path $P "app\main.py"
+if (!(Test-Path $mainPath)) { throw "Nie znaleziono $mainPath" }
+$main = Get-Content $mainPath -Raw -Encoding UTF8
+
+# a) usuń blok z markerami (jeśli był)
+$main = [regex]::Replace($main, '(?s)# --- conId sync on startup.*?# --- end conId sync ---', '')
+# b) usuń try/except z ensure_conids (wariant bez markerów)
+$main = [regex]::Replace($main, '(?s)try:\s*[\s\S]{0,600}?ensure_conids\([^\)]*\)[\s\S]{0,600}?except\s+Exception\s+as\s+e:\s*[\s\S]{0,200}?log\.warning\([^\)]*\)\s*', '')
+# c) usuń import ensure_conids, jeśli był
+$main = [regex]::Replace($main, '(?m)^\s*from\s+agent\.conid_sync\s+import\s+ensure_conids\s*\r?\n', '')
+# d) dodaj import prestart na samą górę (jeśli brak)
+if ($main -notmatch '(?m)^\s*import\s+app\.prestart\b') {
+  $main = "import app.prestart`r`n" + $main
+}
+Set-Content -Path $mainPath -Encoding UTF8 -Value $main
+
+# 5) requirements.txt – dopisz paczki (jeśli brak)
+$reqPath = Join-Path $P "requirements.txt"
+if (Test-Path $reqPath) { $req = Get-Content $reqPath -Raw -Encoding UTF8 } else { $req = "" }
+if ($req -notmatch '(?m)^\s*ibapi\b')        { $req += "`nibapi==9.81.1.post1" }
+if ($req -notmatch '(?m)^\s*ruamel\.yaml\b') { $req += "`nruamel.yaml==0.18.14" }
+if ($req -notmatch '(?m)^\s*ib_insync\b')    { $req += "`nib_insync==0.9.86" }
+Set-Content -Path $reqPath -Encoding UTF8 -Value ($req.Trim()+"`n")
+
+# 6) Build & run
+docker compose build app
+docker compose up -d
+docker compose logs -f app

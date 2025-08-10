@@ -1,18 +1,21 @@
-﻿USDJPY:
+USDJPY:
   kind: forex
-  symbol: USDJPY
-  whatToShow: MIDPOINT
-  barSize: 1 hour
-  duration: 30 D
+  conId: 15016059
+  secType: "CASH"
+  symbol: "USD"         # base
+  exchange: "IDEALPRO"
+  currency: "JPY"       # quote
+  duration: "30 D"
+  barSize: "1 hour"
+  whatToShow: "MIDPOINT"
 
 USDPLN:
   kind: forex
-  symbol: USDPLN
-  whatToShow: MIDPOINT
-  barSize: 1 hour
-  duration: 30 D
-
-# DODAMY PÓŹNIEJ (po teście USDJPY):
-# US100: CFD/Index – trzeba potwierdzić dokładny kontrakt w TWS i uzupełnić mapping
-# GOLD (XAUUSD): spot/metale – bywa zależne od regionu konta
-# OIL.WTI: CFD na WTI albo kontrakt futures CL – też potwierdzimy w TWS
+  conId: 34831481
+  secType: "CASH"
+  symbol: "USD"         # base
+  exchange: "IDEALPRO"
+  currency: "PLN"       # quote
+  duration: "30 D"
+  barSize: "1 hour"
+  whatToShow: "MIDPOINT"

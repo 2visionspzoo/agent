@@ -1,5 +1,6 @@
 # agent/conid_sync.py
 import threading, datetime as dt
+import time  # DODANO: Dla opóźnienia po disconnect
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
@@ -180,6 +181,7 @@ def ensure_conids(
 
     try: app.disconnect()
     except: pass
+    time.sleep(5)  # DODANO: Opóźnienie, aby serwer IB zwolnił clientId przed kolejnym połączeniem
 
     if changed and save_in_place:
         with open(fp, "w", encoding="utf-8") as f:

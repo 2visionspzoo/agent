@@ -6,12 +6,6 @@
     depends_on:
       - db
       - redis
-    volumes:
-      - ./config:/app/config
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    mem_limit: 2g  # DODANO: Limit pamięci na 2GB, aby uniknąć OOM kill (dostosuj jeśli potrzeba więcej)
-    mem_reservation: 1g  # DODANO: Rezerwacja pamięci
   db:
     image: postgres:16
     environment:

@@ -1,0 +1,276 @@
+# --- apply_fix.ps1 ---
+$ErrorActionPreference = "Stop"
+$P = "C:\agent"
+Set-Location $P
+
+# 1) Ustaw/uzupełnij .env (osobny clientId dla sync; host; port)
+$envPath = Join-Path $P ".env"
+if (!(Test-Path $envPath)) { New-Item -Type File $envPath | Out-Null }
+$envText = Get-Content $envPath -Raw -Encoding UTF8
+function Set-EnvLine([string]$key, [string]$val) {
+  if ($script:envText -match ("(?m)^"+[regex]::Escape($key)+"=")) {
+    $script:envText = $script:envText -replace ("(?m)^"+[regex]::Escape($key)+"=.*$"), ($key+"="+$val)
+  } else {
+    if ($script:envText.Length -gt 0 -and -not $script:envText.EndsWith("`n")) { $script:envText += "`n" }
+    $script:envText += ($key+"="+$val+"`n")
+  }
+}
+Set-EnvLine "IBKR_CLIENT_ID_SYNC" "11"
+Set-EnvLine "IBKR_CLIENT_ID"      "1"
+Set-EnvLine "IBKR_HOST"            "host.docker.internal"
+Set-EnvLine "IBKR_PORT"            "4003"
+Set-Content -Path $envPath -Encoding UTF8 -Value $envText
+
+# 2) Nadpisz agent\conid_sync.py bezpieczną wersją (walidacja + poprawna normalizacja)
+$syncPath = Join-Path $P "agent\conid_sync.py"
+@'
+import threading, datetime as dt
+from typing import Dict, Any, List, Optional
+from ruamel.yaml import YAML
+from ibapi.wrapper import EWrapper
+from ibapi.client import EClient
+from ibapi.contract import Contract, ContractDetails
+from pathlib import Path
+
+yaml = YAML()
+yaml.preserve_quotes = True
+
+OVERRIDES = {
+    "US100":   {"secType": "CFD", "exchange": "SMART", "currency": "USD"},
+    "OIL.WTI": {"secType": "CFD", "exchange": "SMART", "currency": "USD"},
+}
+
+def normalize_entry(key: str, d: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(d or {})
+    if key in OVERRIDES:
+        out.update(OVERRIDES[key])
+    out["secType"] = (out.get("secType") or "").upper()
+    out["symbol"]  = (out.get("symbol") or "").upper()
+    if not out.get("exchange"):
+        out["exchange"] = "SMART"
+
+    # FX: "USDPLN"/"USDJPY" -> symbol=USD, currency=PLN/JPY @ IDEALPRO
+    if out["secType"] == "CASH":
+        if len(out["symbol"]) >= 6 and out["symbol"][:3].isalpha() and out["symbol"][-3:].isalpha():
+            base, quote = out["symbol"][:3], out["symbol"][-3:]
+            out["symbol"] = base
+            out["currency"] = quote
+        if not out.get("exchange"):
+            out["exchange"] = "IDEALPRO"
+
+    # Metale spot: "XAUUSD" -> XAU / USD
+    if out["secType"] == "CMDTY" and len(out["symbol"]) >= 6:
+        base, quote = out["symbol"][:3], out["symbol"][-3:]
+        if base in {"XAU","XAG","XPT","XPD"} and quote.isalpha():
+            out["symbol"]   = base
+            out["currency"] = quote
+
+    return out
+
+def to_contract(key: str, d: Dict[str, Any]) -> Contract:
+    nd = normalize_entry(key, d)
+    # Walidacja minimalna
+    if not nd.get("secType"):
+        raise ValueError(f"{key}: missing secType")
+    if not nd.get("symbol"):
+        raise ValueError(f"{key}: missing symbol")
+    if nd["secType"] in ("CASH","CMDTY","CFD") and not nd.get("currency"):
+        raise ValueError(f"{key}: missing currency for {nd['secType']}")
+
+    c = Contract()
+    if nd.get("conId"):
+        try: c.conId = int(nd["conId"])
+        except: pass
+    c.secType  = nd.get("secType")
+    c.symbol   = nd.get("symbol")
+    c.exchange = nd.get("exchange")
+    c.currency = nd.get("currency")
+    if c.secType == "FUT" and nd.get("lastTradeDateOrContractMonth"):
+        c.lastTradeDateOrContractMonth = str(nd["lastTradeDateOrContractMonth"])
+    return c
+
+def score_candidate(want: Dict[str, Any], cd: ContractDetails) -> int:
+    sec = (want.get("secType") or "").upper()
+    exch = (want.get("exchange") or "").upper()
+    cur = (want.get("currency") or "").upper()
+    sym = (want.get("symbol") or "").upper()
+    s = 0
+    if (cd.contract.secType or "").upper() == sec: s += 10
+    if cur and (cd.contract.currency or "").upper() == cur: s += 5
+    if exch and (cd.contract.exchange or "").upper() == exch: s += 4
+    if sym and (cd.contract.symbol or "").upper() == sym: s += 4
+    if sec == "FUT":
+        ltd = cd.contract.lastTradeDateOrContractMonth or ""
+        try:
+            dt_obj = dt.datetime.strptime(ltd, "%Y%m%d") if len(ltd)==8 else (
+                     dt.datetime.strptime(ltd, "%Y%m") if len(ltd)==6 else None)
+            if dt_obj:
+                days = (dt_obj - dt.datetime.utcnow()).days
+                if days >= 0: s += max(0, 100 - min(days, 100))
+        except: pass
+    return s
+
+def pick_best(want: Dict[str, Any], cds: List[ContractDetails]) -> Optional[ContractDetails]:
+    if not cds: return None
+    cds.sort(key=lambda cd: score_candidate(want, cd), reverse=True)
+    return cds[0]
+
+class _Resolver(EWrapper, EClient):
+    def __init__(self):
+        EClient.__init__(self, self)
+        self._next_ready = threading.Event()
+        self._next_id = None
+        self._lock = threading.Lock()
+        self._done = {}
+        self._res = {}
+        self.errors: List[str] = []
+
+    def nextValidId(self, orderId:int):
+        self._next_id = orderId
+        self._next_ready.set()
+
+    def error(self, reqId, code, msg, *_):
+        # pokaż pełny komunikat (ułatwia debug)
+        print("IB error:", reqId, code, msg)
+        if code in (200, 201):
+            self.errors.append(f"[{reqId}] {code} {msg}")
+
+    def contractDetails(self, reqId:int, cd:ContractDetails):
+        with self._lock:
+            self._res.setdefault(reqId, []).append(cd)
+
+    def contractDetailsEnd(self, reqId:int):
+        with self._lock:
+            evt = self._done.get(reqId)
+            if evt: evt.set()
+
+    def _get_req_id(self) -> int:
+        if not self._next_ready.wait(30):
+            raise RuntimeError("Brak nextValidId z TWS/Gateway (30s).")
+        with self._lock:
+            rid = self._next_id
+            self._next_id += 1
+            return rid
+
+    def resolve(self, key: str, item: Dict[str, Any], timeout=20) -> Optional[ContractDetails]:
+        c = to_contract(key, item)  # walidacja już tu
+        reqId = self._get_req_id()
+        evt = threading.Event()
+        with self._lock:
+            self._done[reqId] = evt
+            self._res[reqId] = []
+        self.reqContractDetails(reqId, c)
+        if not evt.wait(timeout): return None
+        return pick_best(normalize_entry(key, item), self._res.get(reqId, []))
+
+def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4002, client_id=11, save_in_place=True) -> bool:
+    fp = Path(path)
+    data = yaml.load(fp.read_text(encoding="utf-8"))
+
+    app = _Resolver()
+    # połączenie + pętla
+    app.connect(host, port, client_id)
+    t = threading.Thread(target=app.run, daemon=True); t.start()
+    if not app._next_ready.wait(30):
+        raise RuntimeError("Nie połączono z IB Gateway/TWS (brak nextValidId).")
+
+    changed = False
+    for key, val in data.items():
+        if not isinstance(val, dict): continue
+        # wstępna walidacja – pomiń niekompletne wpisy z jasnym komunikatem
+        try:
+            _ = to_contract(key, val)
+        except Exception as ve:
+            print(f"[{key}] Pomijam: {ve}")
+            continue
+
+        need_lookup = False
+        if val.get("conId"):
+            cd = app.resolve(key, val, timeout=12)
+            if not cd or int(cd.contract.conId) != int(val["conId"]):
+                need_lookup = True
+        else:
+            need_lookup = True
+
+        if need_lookup:
+            cd = app.resolve(key, val, timeout=20)
+            if not cd:
+                print(f"[{key}] Nie znaleziono kontraktu ({val.get('secType')} {val.get('symbol')}).")
+                continue
+            val["conId"]    = int(cd.contract.conId)
+            val["symbol"]   = cd.contract.symbol
+            val["exchange"] = cd.contract.exchange
+            val["currency"] = cd.contract.currency
+            if cd.contract.secType == "FUT":
+                val["lastTradeDateOrContractMonth"] = cd.contract.lastTradeDateOrContractMonth
+            changed = True
+            print(f"[{key}] conId={val['conId']} | {cd.contract.secType} {val['symbol']}.{val['currency']} @ {val['exchange']}")
+
+    try: app.disconnect()
+    except: pass
+
+    if changed and save_in_place:
+        with open(fp, "w", encoding="utf-8") as f: yaml.dump(data, f)
+        print(f"✓ Zaktualizowano {fp}")
+    elif not changed:
+        print("Brak zmian w symbolach (conId aktualne).")
+    return changed
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="path", default="config/symbols.yaml")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=4002)
+    ap.add_argument("--client", type=int, default=11)
+    args = ap.parse_args()
+    ensure_conids(args.path, args.host, args.port, args.client, save_in_place=True)
+'@ | Set-Content -Encoding UTF8 $syncPath
+
+# 3) Upewnij się, że import i wywołanie w app\main.py używają osobnego clientId dla sync
+$mainPath = Join-Path $P "app\main.py"
+$main = Get-Content $mainPath -Raw -Encoding UTF8
+if ($main -notmatch 'from\s+agent\.conid_sync\s+import\s+ensure_conids') {
+  $main = "from agent.conid_sync import ensure_conids`r`n" + $main
+}
+if ($main -notmatch 'conId sync: OK') {
+  $inj = @"
+# Autoweryfikacja/uzupełnianie conId na starcie (oddzielny clientId, żeby uniknąć #326)
+try:
+    ensure_conids(
+        path="config/symbols.yaml",
+        host=os.getenv("IBKR_HOST", "host.docker.internal"),
+        port=int(os.getenv("IBKR_PORT", "4003")),
+        client_id=int(os.getenv("IBKR_CLIENT_ID_SYNC", "11")),
+        save_in_place=True
+    )
+    log.info("conId sync: OK")
+except Exception as e:
+    log.warning(f"conId sync skipped: {e}")
+"@
+  # wstrzykuj po pierwszym wystąpieniu definicji loggera albo zaraz po importach
+  if ($main -match '(?m)^\s*log\s*=\s*logging\.getLogger\(.*\)\s*$') {
+    $main = $main -replace '(?m)^\s*log\s*=\s*logging\.getLogger\(.*\)\s*$', "`$0`r`n$inj"
+  } else {
+    $main = $main -replace '(?m)^(\s*import .*\n)+', "`$0$inj`r`n"
+  }
+}
+Set-Content -Path $mainPath -Encoding UTF8 -Value $main
+
+# 4) requirements.txt – dołóż wymagane paczki (jeśli brak) [kompatybilne z PS 5.1]
+$reqPath = Join-Path $P "requirements.txt"
+if (Test-Path $reqPath) {
+  $req = Get-Content $reqPath -Raw -Encoding UTF8
+} else {
+  $req = ""
+}
+if ($req -notmatch '(?m)^\s*ibapi')        { $req += "`nibapi==9.81.1.post1" }
+if ($req -notmatch '(?m)^\s*ruamel\.yaml') { $req += "`nruamel.yaml==0.18.14" }
+if ($req -notmatch '(?m)^\s*ib_insync')    { $req += "`nib_insync==0.9.86" }
+Set-Content -Path $reqPath -Encoding UTF8 -Value ($req.Trim() + "`n")
+
+# 5) Rebuild & run
+docker compose build app
+docker compose up -d
+docker compose logs -f app
+# --- koniec apply_fix.ps1 ---

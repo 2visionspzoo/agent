@@ -1,4 +1,30 @@
-﻿import threading, datetime as dt
+# --- apply_fix3.ps1 ---
+$ErrorActionPreference = "Stop"
+$P = "C:\agent"
+Set-Location $P
+
+# 1) .env – różne clientId + host/port
+$envPath = Join-Path $P ".env"
+if (!(Test-Path $envPath)) { New-Item -Type File $envPath | Out-Null }
+$envText = Get-Content $envPath -Raw -Encoding UTF8
+function Set-EnvLine([string]$key, [string]$val) {
+  if ($script:envText -match ("(?m)^"+[regex]::Escape($key)+"=")) {
+    $script:envText = $script:envText -replace ("(?m)^"+[regex]::Escape($key)+"=.*$"), ($key+"="+$val)
+  } else {
+    if ($script:envText.Length -gt 0 -and -not $script:envText.EndsWith("`n")) { $script:envText += "`n" }
+    $script:envText += ($key+"="+$val+"`n")
+  }
+}
+Set-EnvLine "IBKR_HOST" "host.docker.internal"
+Set-EnvLine "IBKR_PORT" "4003"
+Set-EnvLine "IBKR_CLIENT_ID" "101"
+Set-EnvLine "IBKR_CLIENT_ID_SYNC" "12"
+Set-Content -Path $envPath -Encoding UTF8 -Value ($envText.Trim()+"`n")
+
+# 2) Nadpisz agent\conid_sync.py (pomija FX/CASH)
+$syncPath = Join-Path $P "agent\conid_sync.py"
+@'
+import threading, datetime as dt
 from typing import Dict, Any, List, Optional
 from ruamel.yaml import YAML
 from ibapi.wrapper import EWrapper
@@ -15,23 +41,20 @@ OVERRIDES = {
 
 def normalize_entry(key: str, d: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(d or {})
-    if key in OVERRIDES: out.update({k:v for k,v in OVERRIDES[key].items() if v})
+    if key in OVERRIDES: out.update(OVERRIDES[key])
     out["secType"] = (out.get("secType") or "").upper()
-    if out.get("symbol") is not None: out["symbol"] = str(out.get("symbol") or "").upper()
+    out["symbol"]  = (out.get("symbol") or "").upper()
     if not out.get("exchange"): out["exchange"] = "SMART"
+    # FX: USDJPY -> USD/JPY @ IDEALPRO
     if out["secType"] == "CASH":
-        sym = out.get("symbol") or ""; cur = (out.get("currency") or "").upper()
-        if len(sym) >= 6 and sym[:3].isalpha() and sym[-3:].isalpha():
-            out["symbol"], out["currency"] = sym[:3], sym[-3:]
-        elif len(sym) == 3 and cur:
-            out["symbol"], out["currency"] = sym[:3], cur
+        if len(out["symbol"]) >= 6 and out["symbol"][:3].isalpha() and out["symbol"][-3:].isalpha():
+            out["symbol"], out["currency"] = out["symbol"][:3], out["symbol"][-3:]
         if not out.get("exchange"): out["exchange"] = "IDEALPRO"
-    if out["secType"] == "CMDTY":
-        sym = out.get("symbol") or ""
-        if len(sym) >= 6 and sym[:3].isalpha() and sym[-3:].isalpha():
-            base, quote = sym[:3], sym[-3:]
-            if base in {"XAU","XAG","XPT","XPD"}:
-                out["symbol"], out["currency"] = base, quote
+    # CMDTY metale: XAUUSD -> XAU/USD
+    if out["secType"] == "CMDTY" and len(out["symbol"]) >= 6:
+        base, quote = out["symbol"][:3], out["symbol"][-3:]
+        if base in {"XAU","XAG","XPT","XPD"} and quote.isalpha():
+            out["symbol"], out["currency"] = base, quote
     return out
 
 def to_contract(key: str, d: Dict[str, Any]) -> Contract:
@@ -84,8 +107,7 @@ class _Resolver(EWrapper, EClient):
         self._next_ready = threading.Event()
         self._next_id = None
         self._lock = threading.Lock()
-        self._done = {}
-        self._res = {}
+        self._done = {}; self._res = {}
         self.errors: List[str] = []
 
     def nextValidId(self, orderId:int):
@@ -105,7 +127,8 @@ class _Resolver(EWrapper, EClient):
             if evt: evt.set()
 
     def _get_req_id(self) -> int:
-        if not self._next_ready.wait(30): raise RuntimeError("Brak nextValidId z TWS/Gateway (30s).")
+        if not self._next_ready.wait(30):
+            raise RuntimeError("Brak nextValidId z TWS/Gateway (30s).")
         with self._lock:
             rid = self._next_id; self._next_id += 1; return rid
 
@@ -119,30 +142,38 @@ class _Resolver(EWrapper, EClient):
         if not evt.wait(timeout): return None
         return pick_best(normalize_entry(key, item), self._res.get(reqId, []))
 
-def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, client_id=802, save_in_place=True) -> bool:
+def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, client_id=12, save_in_place=True) -> bool:
     fp = Path(path)
     data = yaml.load(fp.read_text(encoding="utf-8"))
 
     app = _Resolver()
     app.connect(host, port, client_id)
     t = threading.Thread(target=app.run, daemon=True); t.start()
-    if not app._next_ready.wait(30): raise RuntimeError("Nie poĹ‚Ä…czono z IB Gateway/TWS (brak nextValidId).")
+    if not app._next_ready.wait(30):
+        raise RuntimeError("Nie połączono z IB Gateway/TWS (brak nextValidId).")
 
     changed = False
     for key, val in data.items():
         if not isinstance(val, dict): continue
-        try: _ = to_contract(key, val)
-        except Exception as ve: print(f"[{key}] Pomijam: {ve}"); continue
+        # Pomijamy FX (CASH) w tym etapie, by uniknąć edge-case'ów
+        if str(val.get("secType","")).upper() == "CASH":
+            print(f"[{key}] Pomijam FX (CASH) na etapie conId sync.")
+            continue
+        try:
+            _ = to_contract(key, val)
+        except Exception as ve:
+            print(f"[{key}] Pomijam: {ve}")
+            continue
 
         need_lookup = not val.get("conId")
         if val.get("conId"):
             cd = app.resolve(key, val, timeout=12)
             if not cd or int(cd.contract.conId) != int(val["conId"]): need_lookup = True
-
         if need_lookup:
             cd = app.resolve(key, val, timeout=20)
             if not cd:
-                print(f"[{key}] Nie znaleziono kontraktu ({val.get('secType')} {val.get('symbol')})."); continue
+                print(f"[{key}] Nie znaleziono kontraktu ({val.get('secType')} {val.get('symbol')}).")
+                continue
             val["conId"]    = int(cd.contract.conId)
             val["symbol"]   = cd.contract.symbol
             val["exchange"] = cd.contract.exchange
@@ -157,7 +188,7 @@ def ensure_conids(path="config/symbols.yaml", host="127.0.0.1", port=4003, clien
 
     if changed and save_in_place:
         with open(fp, "w", encoding="utf-8") as f: yaml.dump(data, f)
-        print(f"âś“ Zaktualizowano {fp}")
+        print(f"✓ Zaktualizowano {fp}")
     elif not changed:
         print("Brak zmian w symbolach (conId aktualne).")
     return changed
@@ -168,6 +199,25 @@ if __name__ == "__main__":
     ap.add_argument("--in", dest="path", default="config/symbols.yaml")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4003)
-    ap.add_argument("--client", type:int, default=802)
+    ap.add_argument("--client", type=int, default=12)
     args = ap.parse_args()
     ensure_conids(args.path, args.host, args.port, args.client, save_in_place=True)
+'@ | Set-Content -Encoding UTF8 $syncPath
+
+# 3) app\main.py – upewnij się, że używa IBKR_CLIENT_ID_SYNC
+$mainPath = Join-Path $P "app\main.py"
+$main = Get-Content $mainPath -Raw -Encoding UTF8
+if ($main -notmatch 'from\s+agent\.conid_sync\s+import\s+ensure_conids') {
+  $main = "from agent.conid_sync import ensure_conids`r`n" + $main
+}
+# zamień ewentualne użycie IBKR_CLIENT_ID na IBKR_CLIENT_ID_SYNC w wywołaniu ensure_conids
+$main = $main -replace 'client_id\s*=\s*int\(\s*os\.getenv\("IBKR_CLIENT_ID"', 'client_id=int(os.getenv("IBKR_CLIENT_ID_SYNC"'
+# ustaw host domyślnie na host.docker.internal, jeśli nie masz
+$main = $main -replace 'host\s*=\s*os\.getenv\("IBKR_HOST",\s*"127\.0\.0\.1"\)', 'host=os.getenv("IBKR_HOST", "host.docker.internal")'
+Set-Content -Path $mainPath -Encoding UTF8 -Value $main
+
+# 4) Rebuild & run
+docker compose build app
+docker compose up -d
+docker compose logs -f app
+# --- koniec ---
