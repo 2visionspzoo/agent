@@ -1,0 +1,7 @@
+risk_per_trade: 0.01
+symbols: [US100, GOLD, OIL.WTI, USDJPY, USDPLN]
+setups:
+  trend_continuation: {enabled: true, ema_fast: 50, ema_slow: 200, atr_mult_sl: 1.25, tp1_atr: 1.0, tp2_atr: 2.0}
+  breakout:           {enabled: true, min_bars: 15, atr_mult_sl: 1.0, box_tp_mult: 1.25}
+  mean_reversion:     {enabled: true, rsi_period: 14, use_macd_divergence: true}
+news_filter: {block_minutes: 45, high_impact_only: true}

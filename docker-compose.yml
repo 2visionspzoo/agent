@@ -1,0 +1,20 @@
+﻿services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: agent
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+  redis:
+    image: redis:7-alpine
+volumes:
+  dbdata:
